@@ -1,3 +1,4 @@
 {
-    "OPENAI_API_KEY": "api key goes here"
+  "OPENAI_API_KEY": "sk-604f85bd26304698ba1329fbbf9ec814",
+  "QWEN_API_KEY": "sk-4f05d17daa20427581995427999ab52e"
 }
