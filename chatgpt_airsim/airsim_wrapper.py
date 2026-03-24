@@ -1,4 +1,6 @@
 import airsim
+import base64
+import cv2
 import math
 import numpy as np
 
@@ -61,3 +63,25 @@ class AirSimWrapper:
             object_names_ue = self.client.simListSceneObjects(query_string)
         pose = self.client.simGetObjectPose(object_names_ue[0])
         return [pose.position.x_val, pose.position.y_val, pose.position.z_val]
+
+    def get_scene_image_base64(self, camera_name="0", image_type=airsim.ImageType.Scene, jpeg_quality=90):
+        response = self.client.simGetImages([
+            airsim.ImageRequest(camera_name, image_type, False, False)
+        ])[0]
+
+        if response.width == 0 or response.height == 0 or len(response.image_data_uint8) == 0:
+            raise RuntimeError("Failed to capture image from AirSim camera.")
+
+        img_1d = np.frombuffer(response.image_data_uint8, dtype=np.uint8)
+        # AirSim uncompressed Scene image is already suitable for OpenCV encode path.
+        img_bgr = img_1d.reshape(response.height, response.width, 3)
+
+        encoded, buffer = cv2.imencode(
+            ".jpg",
+            img_bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
+        )
+        if not encoded:
+            raise RuntimeError("Failed to encode image as JPEG.")
+
+        return base64.b64encode(buffer.tobytes()).decode("ascii")
