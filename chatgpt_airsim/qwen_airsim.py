@@ -55,6 +55,14 @@ MODEL_NAME = "qwen3-vl-flash"
 
 
 def get_response_model_name(completion):
+    """从 API 返回对象中提取模型名。
+
+    Args:
+        completion (dict): OpenAI 兼容接口返回的响应对象。
+
+    Returns:
+        str: 模型名称；当无法解析时返回 "unknown"。
+    """
     try:
         model_name = completion.get("model")
     except Exception:
@@ -69,6 +77,15 @@ def get_response_model_name(completion):
 
 
 def ask(prompt, image_base64=None):
+    """向千问模型发送请求并返回回答。
+
+    Args:
+        prompt (str): 用户输入文本。
+        image_base64 (str | None): 可选的 JPEG 图片 Base64 字符串。
+
+    Returns:
+        str: 模型返回的文本内容。
+    """
     user_content = prompt
     if image_base64 is not None:
         user_content = [
@@ -114,6 +131,16 @@ def ask(prompt, image_base64=None):
 
 
 def parse_vision_command(question):
+    """解析是否触发视觉命令，并提取视觉提示词。
+
+    Args:
+        question (str): 用户输入。
+
+    Returns:
+        tuple[bool, str]:
+            - 第 1 项表示是否触发视觉模式。
+            - 第 2 项为发送给模型的文本提示。
+    """
     trigger = args.vision_trigger
     if not question.startswith(trigger):
         return False, question
@@ -125,6 +152,15 @@ def parse_vision_command(question):
 
 
 def save_debug_image(image_base64, output_dir="vision_debug"):
+    """将 Base64 图片保存为本地调试文件。
+
+    Args:
+        image_base64 (str): 图片 Base64 字符串。
+        output_dir (str): 输出目录，默认值为 vision_debug。
+
+    Returns:
+        str: 已保存图片的完整路径。
+    """
     os.makedirs(output_dir, exist_ok=True)
     file_name = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
     file_path = os.path.join(output_dir, file_name)
@@ -139,6 +175,14 @@ code_block_regex = re.compile(r"```(.*?)```", re.DOTALL)
 
 
 def extract_python_code(content):
+    """从模型回复中提取 Python 代码块。
+
+    Args:
+        content (str): 模型回复文本。
+
+    Returns:
+        str | None: 提取出的代码字符串；若不存在代码块则返回 None。
+    """
     code_blocks = code_block_regex.findall(content)
     if code_blocks:
         full_code = "\n".join(code_blocks)
