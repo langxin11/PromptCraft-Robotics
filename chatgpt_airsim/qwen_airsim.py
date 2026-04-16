@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 from datetime import datetime
 
@@ -16,10 +17,25 @@ parser.add_argument("--prompt", type=str, default="prompts/airsim_basic.txt")
 parser.add_argument("--sysprompt", type=str, default="system_prompts/airsim_basic.txt")
 parser.add_argument("--vision-trigger", type=str, default="!vision")
 parser.add_argument("--debug-api", action="store_true")
+parser.add_argument(
+    "--code-timeout",
+    type=float,
+    default=None,
+    help="模型生成代码的执行超时秒数；<=0 表示禁用超时。",
+)
 args = parser.parse_args()
 
 with open("config.json", "r") as f:
     config = json.load(f)
+
+CODE_EXEC_TIMEOUT_SECONDS = args.code_timeout
+if CODE_EXEC_TIMEOUT_SECONDS is None:
+    CODE_EXEC_TIMEOUT_SECONDS = config.get("CODE_EXEC_TIMEOUT_SECONDS", 8)
+
+try:
+    CODE_EXEC_TIMEOUT_SECONDS = float(CODE_EXEC_TIMEOUT_SECONDS)
+except (TypeError, ValueError):
+    CODE_EXEC_TIMEOUT_SECONDS = 8
 
 print("Initializing Qwen...")
 # 请在 config.json 中增加 QWEN_API_KEY 配置你的阿里云百炼 API Key
@@ -49,9 +65,10 @@ This code uses the `fly_to()` function to move the drone to a new position that 
 ]
 
 DEFAULT_VISION_PROMPT = (
-    "请分析这张无人机前视图，描述关键物体、潜在障碍物和安全飞行建议；"
+    "不要执行代码，请中文分析这张无人机前视图，描述关键物体、潜在障碍物和安全飞行建议；"
 )
-MODEL_NAME = "qwen3-vl-flash"
+FALLBACK_MODEL_NAME = "qwen3-vl-flash"
+MODEL_NAME = config.get("QWEN_MODEL", FALLBACK_MODEL_NAME)
 
 
 def get_response_model_name(completion):
@@ -107,14 +124,37 @@ def ask(prompt, image_base64=None):
             "content": user_content,
         }
     )
-    completion = openai.ChatCompletion.create(
-        model="qwen3-vl-flash", # 这里换成了支持视觉的多模态千问模型
-        messages=chat_history,
-        temperature=0
-    )
+    request_model = MODEL_NAME
+    try:
+        completion = openai.ChatCompletion.create(
+            model=request_model,
+            messages=chat_history,
+            temperature=0
+        )
+    except openai.error.InvalidRequestError as e:
+        err = str(e)
+        unavailable = (
+            "does not exist" in err
+            or "do not have access" in err
+            or "you do not have access" in err
+        )
+        if request_model != FALLBACK_MODEL_NAME and unavailable:
+            print(
+                colors.YELLOW
+                + f"Model '{request_model}' unavailable, fallback to '{FALLBACK_MODEL_NAME}'."
+                + colors.ENDC
+            )
+            request_model = FALLBACK_MODEL_NAME
+            completion = openai.ChatCompletion.create(
+                model=request_model,
+                messages=chat_history,
+                temperature=0
+            )
+        else:
+            raise
     if args.debug_api:
         image_len = len(image_base64) if image_base64 is not None else 0
-        print(colors.BLUE + f"[DEBUG] request.model={MODEL_NAME}, with_image={image_base64 is not None}, image_b64_len={image_len}" + colors.ENDC)
+        print(colors.BLUE + f"[DEBUG] request.model={request_model}, with_image={image_base64 is not None}, image_b64_len={image_len}" + colors.ENDC)
         print(colors.BLUE + f"[DEBUG] response.model={get_response_model_name(completion)}" + colors.ENDC)
 
     assistant_content = completion["choices"][0]["message"]["content"]
@@ -173,6 +213,40 @@ print(f"Done.")
 
 code_block_regex = re.compile(r"```(.*?)```", re.DOTALL)
 
+BLOCKED_CODE_PATTERNS = [
+    (re.compile(r"(^|\W)import\s+", re.IGNORECASE), "不允许导入新模块 (import)"),
+    (re.compile(r"(^|\W)from\s+.+\s+import\s+", re.IGNORECASE), "不允许导入新模块 (from ... import ...)"),
+    (re.compile(r"(^|\W)exec\s*\(", re.IGNORECASE), "不允许调用 exec()"),
+    (re.compile(r"(^|\W)eval\s*\(", re.IGNORECASE), "不允许调用 eval()"),
+    (re.compile(r"(^|\W)open\s*\(", re.IGNORECASE), "不允许直接读写本地文件 (open)"),
+    (re.compile(r"(^|\W)os\s*\.\s*", re.IGNORECASE), "不允许访问 os 模块"),
+    (re.compile(r"(^|\W)sys\s*\.\s*", re.IGNORECASE), "不允许访问 sys 模块"),
+    (re.compile(r"(^|\W)(exit|quit)\s*\(", re.IGNORECASE), "不允许退出主程序 (exit/quit)"),
+]
+
+SAFE_BUILTINS = {
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "float": float,
+    "int": int,
+    "len": len,
+    "list": list,
+    "max": max,
+    "min": min,
+    "print": print,
+    "range": range,
+    "round": round,
+    "set": set,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
+    "zip": zip,
+}
+
 
 def extract_python_code(content):
     """从模型回复中提取 Python 代码块。
@@ -193,6 +267,79 @@ def extract_python_code(content):
         return full_code
     else:
         return None
+
+
+def validate_generated_code(code):
+    """检查模型代码是否包含高风险语句。
+
+    Args:
+        code (str): 模型生成的 Python 代码。
+
+    Returns:
+        tuple[bool, str]:
+            - 第 1 项表示是否通过校验。
+            - 第 2 项为失败原因，成功时为空字符串。
+    """
+    if not code.strip():
+        return False, "代码块为空。"
+
+    if len(code) > 4000:
+        return False, "代码过长，已拒绝执行。"
+
+    for pattern, reason in BLOCKED_CODE_PATTERNS:
+        if pattern.search(code):
+            return False, reason
+
+    return True, ""
+
+
+def run_generated_code(code):
+    """在受限环境中执行模型代码，避免主程序退出。"""
+    ok, reason = validate_generated_code(code)
+    if not ok:
+        print(colors.RED + f"Blocked generated code: {reason}" + colors.ENDC)
+        return
+
+    sandbox_globals = {
+        "__builtins__": SAFE_BUILTINS,
+        "aw": aw,
+        "np": np,
+        "math": math,
+        "time": time,
+    }
+
+    try:
+        execute_generated_code_with_timeout(code, sandbox_globals, CODE_EXEC_TIMEOUT_SECONDS)
+    except TimeoutError as e:
+        print(colors.RED + f"Generated code timed out: {e}" + colors.ENDC)
+    except BaseException as e:
+        # 捕获包括 SystemExit 在内的异常，防止模型代码导致主循环退出。
+        print(colors.RED + f"Generated code failed but chatbot is still running: {e}" + colors.ENDC)
+
+
+def execute_generated_code_with_timeout(code, sandbox_globals, timeout_seconds):
+    """以可选超时方式执行代码。
+
+    说明：该方案可中断大多数 Python 层死循环；
+    对底层阻塞调用（例如某些 C 扩展中的长时间阻塞）可能无法立即中断。
+    """
+    if timeout_seconds is None or timeout_seconds <= 0:
+        exec(code, sandbox_globals, {})
+        return
+
+    deadline = time.time() + timeout_seconds
+
+    def timeout_tracer(frame, event, arg):
+        if time.time() > deadline:
+            raise TimeoutError(f"execution exceeded {timeout_seconds:.1f}s")
+        return timeout_tracer
+
+    old_trace = sys.gettrace()
+    try:
+        sys.settrace(timeout_tracer)
+        exec(code, sandbox_globals, {})
+    finally:
+        sys.settrace(old_trace)
 
 
 class colors:  # You may need to change color settings
@@ -243,5 +390,5 @@ while True:
     code = extract_python_code(response)
     if code is not None:
         print("Please wait while I run the code in AirSim...")
-        exec(extract_python_code(response))
+        run_generated_code(code)
         print("Done!\n")
